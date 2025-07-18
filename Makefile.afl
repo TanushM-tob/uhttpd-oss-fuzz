@@ -1,0 +1,151 @@
+#!/usr/bin/make -f
+
+# AFL++ Makefile for uhttpd fuzz target (uhttpd-fuzz)
+# Based on relayd AFL++ Makefile pattern
+
+# -----------------------------------------------------------------------------
+# 1. Compiler
+# -----------------------------------------------------------------------------
+CC := afl-clang-lto
+
+# -----------------------------------------------------------------------------
+# 2. Paths & flags
+# -----------------------------------------------------------------------------
+DEPS_DIR := $(abspath $(CURDIR)/deps)
+INSTALL_PREFIX := $(DEPS_DIR)/install
+CFLAGS_BASE := -O2 -fPIC -std=gnu99 -g -Wall -Wno-c23-extensions -D_GNU_SOURCE -DHAVE_SHADOW -D__AFL_COMPILER
+CFLAGS := $(CFLAGS_BASE) -I$(INSTALL_PREFIX)/include -I$(CURDIR)
+LDFLAGS := -L$(INSTALL_PREFIX)/lib
+
+# -----------------------------------------------------------------------------
+# 3. Sources
+# -----------------------------------------------------------------------------
+CORE_SRC := utils.c client.c file.c auth.c proc.c handler.c listen.c plugin.c relay.c cgi.c
+MISSING_SYMBOLS_SRC := missing_symbols.c
+FUZZER_SRC := uhttpd-fuzz.c
+
+OBJ_DIR := obj
+CORE_OBJ := $(CORE_SRC:%.c=$(OBJ_DIR)/%.o)
+MISSING_SYMBOLS_OBJ := $(OBJ_DIR)/missing_symbols.o
+FUZZER_OBJ := $(OBJ_DIR)/fuzzer.o
+
+FUZZER_BIN := uhttpd_afl_fuzzer
+
+# -----------------------------------------------------------------------------
+# 4. Top-level targets
+# -----------------------------------------------------------------------------
+.PHONY: all deps clean distclean help prepare-sources
+all: deps prepare-sources $(FUZZER_BIN)
+
+# -----------------------------------------------------------------------------
+# 5. Dependencies (libubox, libjson-c)
+# -----------------------------------------------------------------------------
+DEPS_LIBS := $(INSTALL_PREFIX)/lib/libubox.a $(INSTALL_PREFIX)/lib/libblobmsg_json.a
+
+deps: $(DEPS_LIBS)
+	@echo "✓ Dependencies built"
+
+$(INSTALL_PREFIX)/lib/libubox.a $(INSTALL_PREFIX)/lib/libblobmsg_json.a:
+	@echo "[libubox] building"
+	@mkdir -p $(DEPS_DIR)
+	@if [ ! -d "$(DEPS_DIR)/libubox" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://github.com/openwrt/libubox.git; \
+	fi
+	@cd $(DEPS_DIR)/libubox && rm -rf tests examples lua || true
+	@cd $(DEPS_DIR)/libubox && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*examples/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/libubox && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*lua/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/libubox && mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" -DCMAKE_C_COMPILER="$(CC)" \
+		      -DCMAKE_C_FLAGS="-O2 -fPIC -g" -DBUILD_STATIC=ON -DBUILD_SHARED_LIBS=OFF \
+		      -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF && make -j$$(nproc) && make install
+
+# -----------------------------------------------------------------------------
+# 6. Prepare source files for fuzzing
+# -----------------------------------------------------------------------------
+prepare-sources:
+	@echo "[uhttpd] Preparing sources for fuzzing"
+	@# Make fuzzing target functions non-static
+	@sed -i 's/static void client_parse_header/void client_parse_header/g' client.c 2>/dev/null || true
+	@sed -i 's/static bool __handle_file_request/bool __handle_file_request/g' file.c 2>/dev/null || true
+	@# Remove _GNU_SOURCE redefinitions to avoid warnings
+	@find . -name "*.c" -exec sed -i 's/#define _GNU_SOURCE//g' {} \; 2>/dev/null || true
+	@# Add function declarations to header if not already present
+	@if ! grep -q "void client_parse_header" uhttpd.h 2>/dev/null; then \
+		sed -i '/void uh_client_notify_state/a void client_parse_header(struct client *cl, char *data);' uhttpd.h 2>/dev/null || true; \
+	fi
+	@if ! grep -q "bool __handle_file_request" uhttpd.h 2>/dev/null; then \
+		sed -i '/void client_parse_header/a bool __handle_file_request(struct client *cl, char *url, bool is_error_handler);' uhttpd.h 2>/dev/null || true; \
+	fi
+	@echo "✓ Source preparation complete"
+
+# -----------------------------------------------------------------------------
+# 7. Generate missing_symbols.c (stub functions for missing symbols)
+# -----------------------------------------------------------------------------
+$(MISSING_SYMBOLS_SRC):
+	@echo "[uhttpd] Generating missing symbols stub"
+	@echo '// Minimal stub functions for missing symbols that are not in libubox' > $@
+	@echo '#include <stdint.h>' >> $@
+	@echo '#include <stdio.h>' >> $@
+	@echo '' >> $@
+	@echo '// Global buffer used by uhttpd' >> $@
+	@echo 'char uh_buf[4096];' >> $@
+	@echo '' >> $@
+	@echo '// TLS functions (stubbed since TLS is disabled)' >> $@
+	@echo 'int uh_tls_init(const char *key, const char *crt, const char *ciphers) { return 0; }' >> $@
+	@echo 'void uh_tls_client_attach(void *cl) { }' >> $@
+	@echo 'void uh_tls_client_detach(void *cl) { }' >> $@
+	@echo '' >> $@
+	@echo '// Connection close function' >> $@
+	@echo 'void uh_connection_close(void *cl) { }' >> $@
+	@echo '' >> $@
+	@echo '// JSON script functions (stubbed since we do not need handler functionality for fuzzing)' >> $@
+	@echo 'void json_script_init(void *ctx, void *ops, void *priv) { }' >> $@
+	@echo 'void *json_script_file_from_blobmsg(const char *name, void *blob, int len) { return NULL; }' >> $@
+	@echo 'void json_script_run_file(void *ctx, void *file, void *vars) { }' >> $@
+	@echo 'void json_script_abort(void *ctx) { }' >> $@
+
+# -----------------------------------------------------------------------------
+# 8. Compilation rules
+# -----------------------------------------------------------------------------
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(MISSING_SYMBOLS_OBJ): $(MISSING_SYMBOLS_SRC) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(FUZZER_OBJ): $(FUZZER_SRC) deps | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Wno-error=implicit-function-declaration -c $< -o $@
+
+# -----------------------------------------------------------------------------
+# 9. Linking
+# -----------------------------------------------------------------------------
+$(FUZZER_BIN): $(CORE_OBJ) $(MISSING_SYMBOLS_OBJ) $(FUZZER_OBJ)
+	$(CC) $(CFLAGS) $(CORE_OBJ) $(MISSING_SYMBOLS_OBJ) $(FUZZER_OBJ) $(LDFLAGS) \
+		-lubox -lblobmsg_json -ljson-c -lcrypt -ldl -pthread -lrt -o $@
+	@echo "✓ Built: $@"
+
+# -----------------------------------------------------------------------------
+# 10. Convenience targets
+# -----------------------------------------------------------------------------
+clean:
+	rm -rf $(OBJ_DIR) $(FUZZER_BIN) $(MISSING_SYMBOLS_SRC)
+
+distclean: clean
+	rm -rf $(DEPS_DIR)
+
+help:
+	@echo "AFL++ uhttpd fuzzer Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all           - Build fuzzer (default)"
+	@echo "  deps          - Build dependencies only"
+	@echo "  clean         - Remove build artifacts"
+	@echo "  distclean     - Remove build artifacts and dependencies"
+	@echo "  help          - Show this help"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make all      - Build the uhttpd AFL++ fuzzer"
+	@echo "  make clean    - Clean build artifacts"
